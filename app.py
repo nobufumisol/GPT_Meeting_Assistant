@@ -1,117 +1,141 @@
 import streamlit as st
-import whisper
 import openai
 import os
-import tempfile
-import mammoth
-import docx2txt
-import pandas as pd
-import pptx
-from PyPDF2 import PdfReader
+import io
+import base64
 from PIL import Image
+from PyPDF2 import PdfReader
+from docx2txt import process as docx_process
+import pandas as pd
+import mammoth
 import pytesseract
+import tempfile
 
-# 初期化
-if 'summary' not in st.session_state:
-    st.session_state.summary = ""
-if 'suggestion' not in st.session_state:
-    st.session_state.suggestion = ""
-
+# =========================
+# 初期設定
+# =========================
+st.set_page_config(page_title="GPT Meeting Assistant")
 openai.api_key = st.secrets["openai_key"]
 
+# =========================
+# アジェンダ読み込み処理
+# =========================
+def read_file(file):
+    file_type = file.type
+    if file_type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(file.read())
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as docx_file:
+            result = mammoth.convert_to_text(docx_file)
+            return result.value
+    elif file_type in ["application/pdf"]:
+        reader = PdfReader(file)
+        return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+    elif file_type in ["text/plain"]:
+        return file.read().decode("utf-8")
+    elif file_type in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]:
+        df = pd.read_excel(file)
+        return df.to_string(index=False)
+    elif file_type in ["image/png", "image/jpeg", "image/jpg", "image/gif"]:
+        image = Image.open(file)
+        return pytesseract.image_to_string(image, lang="jpn")
+    else:
+        return "(このファイル形式は現在サポートされていません)"
+
+# =========================
+# ファイルダウンロード用ユーティリティ
+# =========================
+def get_download_button(content, filename, label, key):
+    b64 = base64.b64encode(content.encode()).decode()
+    href = f'<a href="data:file/txt;base64,{b64}" download="{filename}">{label}</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
+# =========================
+# UI 構成
+# =========================
 st.title("GPT Meeting Assistant")
 
-# ユーザー入力
-prompt_input = st.text_area("🔧 プロンプト（任意）", placeholder="プロンプトを入力。未入力ならパートナー視点が使われます。")
-agenda_files = st.file_uploader("📂 アジェンダファイル（最大10個）", type=["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "jpg", "jpeg", "png", "gif"], accept_multiple_files=True)
-audio_file = st.file_uploader("🎧 音声ファイルアップロード", type=["mp3", "mp4", "wav", "m4a"])
+uploaded_audio = st.file_uploader("🎧 音声ファイルをアップロード", type=["wav", "mp3", "m4a", "mp4"])
+prompt_input = st.text_area("🤖 プロンプト（未入力なら「パートナー」視点）", "")
+agenda_files = st.file_uploader("📎 アジェンダ資料（複数可・最大10件）", accept_multiple_files=True)
 
-# 分析開始
-if st.button("分析を開始"):
-    if audio_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            temp_audio.write(audio_file.read())
-            temp_audio_path = temp_audio.name
+if st.button("💬 分析を開始", type="primary"):
+    if uploaded_audio is None:
+        st.error("音声ファイルをアップロードしてください。")
+    else:
+        # --------------------------
+        # 音声ファイルを一時保存
+        # --------------------------
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_audio:
+            tmp_audio.write(uploaded_audio.read())
+            temp_audio_path = tmp_audio.name
 
-        st.write("🔁 Whisperで文字起こし中...")
-        transcription = whisper.load_model("medium").transcribe(temp_audio_path, language="ja")
+        # --------------------------
+        # Whisper APIで文字起こし
+        # --------------------------
+        with open(temp_audio_path, "rb") as audio_file:
+            st.info("Whisper API で文字起こし中...")
+            transcription = openai.Audio.transcribe(
+                model="whisper-1",
+                file=audio_file,
+                language="ja"
+            )
         text = transcription["text"]
 
-        st.write("📑 アジェンダ読み込み中...")
+        # --------------------------
+        # アジェンダまとめて読み込み
+        # --------------------------
         agenda_texts = []
-        for f in agenda_files:
-            ext = f.name.split(".")[-1].lower()
-            with tempfile.NamedTemporaryFile(delete=False, suffix="." + ext) as tmp:
-                tmp.write(f.read())
-                path = tmp.name
+        if agenda_files:
+            for i, f in enumerate(agenda_files[:10]):
+                st.success(f"{i+1}. {f.name} を読み込みました")
+                agenda_texts.append(read_file(f))
+        combined_agenda = "\n\n".join(agenda_texts)
 
-            try:
-                if ext in ["txt"]:
-                    with open(path, "r", encoding="utf-8") as file:
-                        agenda_texts.append(file.read())
-                elif ext in ["pdf"]:
-                    pdf = PdfReader(path)
-                    content = "\n".join([p.extract_text() or "" for p in pdf.pages])
-                    agenda_texts.append(content)
-                elif ext in ["docx"]:
-                    agenda_texts.append(docx2txt.process(path))
-                elif ext in ["doc"]:
-                    result = mammoth.convert_to_markdown(open(path, "rb"))
-                    agenda_texts.append(result.value)
-                elif ext in ["xls", "xlsx"]:
-                    df = pd.read_excel(path)
-                    agenda_texts.append(df.to_string(index=False))
-                elif ext in ["ppt", "pptx"]:
-                    pres = pptx.Presentation(path)
-                    slides_text = []
-                    for slide in pres.slides:
-                        for shape in slide.shapes:
-                            if hasattr(shape, "text"):
-                                slides_text.append(shape.text)
-                    agenda_texts.append("\n".join(slides_text))
-                elif ext in ["jpg", "jpeg", "png", "gif"]:
-                    img = Image.open(path)
-                    text_img = pytesseract.image_to_string(img, lang="jpn")
-                    agenda_texts.append(text_img)
-            except Exception as e:
-                agenda_texts.append(f"(読み込みエラー: {f.name})")
-
-        agenda = "\n\n".join(agenda_texts)
-        role_prompt = prompt_input.strip() or (
+        # --------------------------
+        # プロンプト設定
+        # --------------------------
+        default_partner_prompt = (
             "あなたは信頼できるパートナーとして、会話の流れを大切にしながら、"
-            "素晴らしい視点には共感を示し、議論に足りない視点には誰もがハッとするような問いをユーモアを交えて提示できます。"
-            "問いを出すときは、なぜその問いが必要なのか、答えなければ起こり得るリスクや未来のズレを具体例で示してください。"
+            "素晴らしい視点には共感を示し、議論に足りない視点には誰もがハッとするような問いをユーモアを交えて提示できます。\n"
+            "問いを出すときは、なぜその問いが必要なのか、答えなければ起こり得るリスクや未来のズレを具体例で示してください。\n"
+            "たとえば「これが話されていないと、後から〇〇で揉める可能性がある」といった視点を添えてください。\n"
             "問いのトーンは柔らかく、それでいて鋭く。「確かに…それ、大事ですね」と思わせる問いを目指してください。"
         )
+        role_prompt = prompt_input.strip() if prompt_input.strip() else default_partner_prompt
 
-        # 要約
-        st.write("🧠 ChatGPTで要約中...")
+        # --------------------------
+        # ChatGPT要約
+        # --------------------------
+        st.info("ChatGPT に要約依頼中...")
         summary_prompt = f"""
 以下は会議の文字起こしです。以下の4点を遵守し、事実のみをビジネス向けの丁寧な文章でまとめてください。
-1.議論のポイントを漏れなく
-2.読みやすく
-3.簡潔に
-4.構造的に
+1. 議論のポイントを漏れなく
+2. 読みやすく
+3. 簡潔に
+4. 構造的に
 
 《アジェンダ》
-{agenda}
+{combined_agenda}
 
 《文字起こし》
 {text}
-"""
-        summary_response = openai.chat.completions.create(
+        """
+        summary_response = openai.ChatCompletion.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": summary_prompt}]
         )
-        st.session_state.summary = summary_response.choices[0].message.content
+        summary_result = summary_response["choices"][0]["message"]["content"]
 
-        # 提案
-        st.write("💡 ChatGPTで提案中...")
+        # --------------------------
+        # ChatGPT提案
+        # --------------------------
+        st.info("ChatGPT に提案依頼中...")
         suggestion_prompt = f"""
 以下は会議の文字起こしです。
-
 《アジェンダ》
-{agenda}
+{combined_agenda}
 
 《文字起こし》
 {text}
@@ -122,37 +146,25 @@ if st.button("分析を開始"):
 - リスクとその回避策
 
 を具体例や理由を添えて、深い共感が得られる形で提案してください。
-"""
-        suggestion_response = openai.chat.completions.create(
+        """
+        suggestion_response = openai.ChatCompletion.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": role_prompt},
                 {"role": "user", "content": suggestion_prompt}
             ]
         )
-        st.session_state.suggestion = suggestion_response.choices[0].message.content
+        suggestion_result = suggestion_response["choices"][0]["message"]["content"]
 
-        st.success("✅ 分析が完了しました！下からダウンロードできます。")
+        # --------------------------
+        # 表示・ダウンロード
+        # --------------------------
+        st.success("✅ 分析完了！")
 
-# 出力表示＆ダウンロード（常時表示）
-if st.session_state.summary:
-    st.subheader("📄 会議要約")
-    st.text_area("会議要約プレビュー", st.session_state.summary, height=200)
-    st.download_button(
-        label="⬇ 要約をダウンロード",
-        data=st.session_state.summary,
-        file_name="summary.txt",
-        mime="text/plain",
-        key="download_summary"
-    )
+        st.subheader("📄 要約")
+        st.write(summary_result)
+        get_download_button(summary_result, "summary.txt", "⬇ 要約をダウンロード", key="summary")
 
-if st.session_state.suggestion:
-    st.subheader("💡 ChatGPTの提案")
-    st.text_area("提案プレビュー", st.session_state.suggestion, height=200)
-    st.download_button(
-        label="⬇ 提案をダウンロード",
-        data=st.session_state.suggestion,
-        file_name="suggestions.txt",
-        mime="text/plain",
-        key="download_suggestion"
-    )
+        st.subheader("💡 提案")
+        st.write(suggestion_result)
+        get_download_button(suggestion_result, "suggestion.txt", "⬇ 提案をダウンロード", key="suggestion")
