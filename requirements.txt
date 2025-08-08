@@ -1,0 +1,12 @@
+streamlit
+openai
+whisper
+pytesseract
+python-pptx
+pandas
+PyPDF2
+docx2txt
+mammoth
+Pillow
+python-docx
+python-magic

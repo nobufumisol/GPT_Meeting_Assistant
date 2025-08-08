@@ -1,0 +1,10 @@
+# 除外するフォルダ
+download/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+
+# Pythonキャッシュなど
+__pycache__/
+*.pyc
